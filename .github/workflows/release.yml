@@ -1,0 +1,101 @@
+name: Release Custom Sing-Box
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g. 1.12.0)'
+        required: true
+        default: '1.12.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Linux ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          check-latest: true
+
+      - name: Determine Version
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RAW="${{ github.event.inputs.version }}"
+          else
+            RAW="${GITHUB_REF#refs/tags/}"
+          fi
+          VERSION="${RAW#v}"
+          echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
+          echo "TAG_NAME=v${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Build Binary
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.arch }} go build -v -trimpath \
+            -ldflags "-X github.com/sagernet/sing-box/constant.Version=${{ steps.ver.outputs.VERSION }} -s -w -buildid=" \
+            -tags "with_reality,with_clash_api,with_quic,with_wireguard,with_ech" \
+            -o dist/sing-box ./cmd/sing-box
+
+      - name: Package Archive
+        run: |
+          ARCHIVE_NAME="sing-box-${{ steps.ver.outputs.VERSION }}-linux-${{ matrix.arch }}.tar.gz"
+          tar -czvf "${ARCHIVE_NAME}" -C dist sing-box
+          echo "ARCHIVE_PATH=${ARCHIVE_NAME}" >> $GITHUB_ENV
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sing-box-linux-${{ matrix.arch }}
+          path: ${{ env.ARCHIVE_PATH }}
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine Version
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RAW="${{ github.event.inputs.version }}"
+          else
+            RAW="${GITHUB_REF#refs/tags/}"
+          fi
+          VERSION="${RAW#v}"
+          echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
+          echo "TAG_NAME=v${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create or Update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.TAG_NAME }}
+          name: sing-box ${{ steps.ver.outputs.TAG_NAME }}
+          draft: false
+          prerelease: false
+          files: release-assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
