@@ -18,13 +18,10 @@ import (
 	"github.com/sagernet/sing/service"
 
 	"github.com/database64128/tfo-go/v2"
+	proxyproto "github.com/pires/go-proxyproto"
 )
 
 func (l *Listener) ListenTCP() (net.Listener, error) {
-	//nolint:staticcheck
-	if l.listenOptions.ProxyProtocol || l.listenOptions.ProxyProtocolAcceptNoHeader {
-		return nil, E.New("Proxy Protocol is deprecated and removed in sing-box 1.6.0")
-	}
 	var err error
 	bindAddr := M.SocksaddrFrom(l.listenOptions.Listen.Build(netip.AddrFrom4([4]byte{127, 0, 0, 1})), l.listenOptions.ListenPort)
 	var listenConfig net.ListenConfig
@@ -76,6 +73,23 @@ func (l *Listener) ListenTCP() (net.Listener, error) {
 	})
 	if err != nil {
 		return nil, err
+	}
+	if l.listenOptions.ProxyProtocol || l.listenOptions.ProxyProtocolAcceptNoHeader {
+		var policy proxyproto.PolicyFunc
+		if l.listenOptions.ProxyProtocolAcceptNoHeader {
+			policy = func(upstream net.Addr) (proxyproto.Policy, error) {
+				return proxyproto.USE, nil
+			}
+		} else {
+			policy = func(upstream net.Addr) (proxyproto.Policy, error) {
+				return proxyproto.REQUIRE, nil
+			}
+		}
+		tcpListener = &proxyproto.Listener{
+			Listener:          tcpListener,
+			Policy:            policy,
+			ReadHeaderTimeout: 5 * time.Second,
+		}
 	}
 	l.logger.Info("tcp server started at ", tcpListener.Addr())
 	l.tcpListener = tcpListener
