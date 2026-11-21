@@ -3,7 +3,6 @@ package mux
 import (
 	"context"
 	"net"
-	"sync"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/dialer"
@@ -16,14 +15,12 @@ import (
 	N "github.com/sagernet/sing/common/network"
 )
 
-// Client wraps sing-mux.Client with a lazy companion client for Windows-TTL
-// flows so multiplexed chained outbounds never mix TTL=128 and TTL=64 traffic
-// onto the same outer TCP connection.
+// Client wraps sing-mux.Client with lazy companion clients keyed by non-zero
+// initial TTL (e.g., 128 for Windows, 192 for Linux, 255 for Apple) so
+// multiplexed chained outbounds never mix OS fingerprints on the same outer TCP.
 type Client struct {
-	base         *mux.Client
-	winMu        sync.Mutex
-	win          *mux.Client
-	newWinClient func() (*mux.Client, error)
+	base    *mux.Client
+	ttlPool dialer.TTLClientPool[*mux.Client]
 }
 
 func NewClientWithOptions(d N.Dialer, logger logger.Logger, options option.OutboundMultiplexOptions) (*Client, error) {
@@ -58,30 +55,17 @@ func NewClientWithOptions(d N.Dialer, logger logger.Logger, options option.Outbo
 	if err != nil {
 		return nil, err
 	}
-	return &Client{
-		base: base,
-		newWinClient: func() (*mux.Client, error) {
-			winOpts := baseOpts
-			winOpts.Dialer = &clientDialer{Dialer: d, initialTTL: dialer.WindowsInitialTTL}
-			return mux.NewClient(winOpts)
-		},
-	}, nil
+	c := &Client{base: base}
+	c.ttlPool.Init(func(ttl int) (*mux.Client, error) {
+		ttlOpts := baseOpts
+		ttlOpts.Dialer = &clientDialer{Dialer: d, initialTTL: ttl}
+		return mux.NewClient(ttlOpts)
+	})
+	return c, nil
 }
 
 func (c *Client) selectClient(ctx context.Context) (*mux.Client, error) {
-	if !dialer.IsWindowsTTLContext(ctx) || c.newWinClient == nil {
-		return c.base, nil
-	}
-	c.winMu.Lock()
-	defer c.winMu.Unlock()
-	if c.win == nil {
-		w, err := c.newWinClient()
-		if err != nil {
-			return nil, err
-		}
-		c.win = w
-	}
-	return c.win, nil
+	return c.ttlPool.Get(ctx, c.base)
 }
 
 func (c *Client) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
@@ -102,43 +86,32 @@ func (c *Client) ListenPacket(ctx context.Context, destination M.Socksaddr) (net
 
 func (c *Client) Reset() {
 	c.base.Reset()
-	c.winMu.Lock()
-	win := c.win
-	c.winMu.Unlock()
-	if win != nil {
-		win.Reset()
-	}
+	c.ttlPool.ForEach(func(cl *mux.Client) {
+		cl.Reset()
+	})
 }
 
 func (c *Client) SetKeepIdleConnections(keep bool) {
 	c.base.SetKeepIdleConnections(keep)
-	c.winMu.Lock()
-	win := c.win
-	c.winMu.Unlock()
-	if win != nil {
-		win.SetKeepIdleConnections(keep)
-	}
+	c.ttlPool.ForEach(func(cl *mux.Client) {
+		cl.SetKeepIdleConnections(keep)
+	})
 }
 
 func (c *Client) CloseIdleConnections() {
 	c.base.CloseIdleConnections()
-	c.winMu.Lock()
-	win := c.win
-	c.winMu.Unlock()
-	if win != nil {
-		win.CloseIdleConnections()
-	}
+	c.ttlPool.ForEach(func(cl *mux.Client) {
+		cl.CloseIdleConnections()
+	})
 }
 
 func (c *Client) Close() error {
 	err := c.base.Close()
-	c.winMu.Lock()
-	win := c.win
-	c.win = nil
-	c.winMu.Unlock()
-	if win != nil {
-		if winErr := win.Close(); winErr != nil && err == nil {
-			err = winErr
+	for _, cl := range c.ttlPool.TakeAll() {
+		if cl != nil {
+			if clErr := cl.Close(); clErr != nil && err == nil {
+				err = clErr
+			}
 		}
 	}
 	return err

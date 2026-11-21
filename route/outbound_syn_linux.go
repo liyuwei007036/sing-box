@@ -11,7 +11,9 @@ import (
 
 	"github.com/mdlayher/netlink"
 	"github.com/sagernet/nftables"
+	"github.com/sagernet/nftables/binaryutil"
 	"github.com/sagernet/nftables/expr"
+	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing/common"
 	"golang.org/x/sys/unix"
@@ -26,6 +28,7 @@ const (
 
 	nfqaPacketHdr  = 1
 	nfqaVerdictHdr = 2
+	nfqaMark       = 3
 	nfqaPayload    = 10
 
 	nfqaCfgCmd    = 1
@@ -44,16 +47,15 @@ const (
 	nfqCopyRange = 256
 )
 
-// outboundSYNRewriter intercepts ONLY outbound pure TCP SYN packets whose
-// IPv4 TTL / IPv6 Hop Limit == 128 via NFQUEUE (with kernel bypass + fail-open)
-// and reorders their TCP options to match native Windows 10/11:
+// outboundSYNRewriter intercepts ONLY outbound pure TCP SYN packets that match:
+//   - IPv4 TTL / IPv6 Hop Limit == 128 -> rewritten to native Windows 10/11:
+//     MSS(orig), NOP, WSCALE(orig=8), NOP, NOP, SACK_PERM (12B, no TS)
+//   - SO_MARK == AppleEgressMark (0x51a9) -> rewritten to native Apple XNU:
+//     WIN=65535 + MSS(orig), NOP, WSCALE(orig=6), NOP, NOP, TS(orig_tsval,0),
+//     SACK_PERM, EOL, EOL (24B) while preserving TTL=64
 //
-//	MSS(orig), NOP, WSCALE(orig), NOP, NOP, SACK_PERM
-//
-// Removing TCP Timestamp from the SYN is 100% RFC 7323 compliant (the remote
-// server omits TS in SYN-ACK and the Linux kernel sets tstamp_ok=0), while
-// keeping MSS and WSCALE identical to what the Linux kernel natively selected
-// (WSCALE=8 via SO_RCVBUFFORCE) so TCP state never desyncs.
+// Kernel bypass + NFQA_CFG_F_FAIL_OPEN guarantee zero packet drops if the
+// userspace rewriter is ever busy or restarting.
 type outboundSYNRewriter struct {
 	logger    log.ContextLogger
 	nlConn    *netlink.Conn
@@ -148,7 +150,7 @@ func addOutboundSYNNftRules(conn *nftables.Conn, table *nftables.Table, queueNum
 		Policy:   common.Ptr(nftables.ChainPolicyAccept),
 	})
 
-	// Rule 1: IPv4 TTL == 128 && pure TCP SYN (FIN=0,SYN=1,RST=0,ACK=0)
+	// Rule 1: IPv4 TTL == 128 && pure TCP SYN (Windows IPv4)
 	conn.AddRule(&nftables.Rule{
 		Table: table,
 		Chain: chain,
@@ -156,7 +158,7 @@ func addOutboundSYNNftRules(conn *nftables.Conn, table *nftables.Table, queueNum
 			&expr.Meta{Key: expr.MetaKeyNFPROTO, Register: 1},
 			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{unix.NFPROTO_IPV4}},
 			&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 8, Len: 1},
-			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{128}},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{dialer.WindowsInitialTTL}},
 			&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
 			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{unix.IPPROTO_TCP}},
 			&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseTransportHeader, Offset: 13, Len: 1},
@@ -166,7 +168,7 @@ func addOutboundSYNNftRules(conn *nftables.Conn, table *nftables.Table, queueNum
 		},
 	})
 
-	// Rule 2: IPv6 HopLimit == 128 && pure TCP SYN
+	// Rule 2: IPv6 HopLimit == 128 && pure TCP SYN (Windows IPv6)
 	conn.AddRule(&nftables.Rule{
 		Table: table,
 		Chain: chain,
@@ -174,7 +176,23 @@ func addOutboundSYNNftRules(conn *nftables.Conn, table *nftables.Table, queueNum
 			&expr.Meta{Key: expr.MetaKeyNFPROTO, Register: 1},
 			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{unix.NFPROTO_IPV6}},
 			&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 7, Len: 1},
-			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{128}},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{dialer.WindowsInitialTTL}},
+			&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{unix.IPPROTO_TCP}},
+			&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseTransportHeader, Offset: 13, Len: 1},
+			&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 1, Mask: []byte{0x17}, Xor: []byte{0x00}},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{0x02}},
+			&expr.Queue{Num: queueNum, Total: 1, Flag: expr.QueueFlagBypass},
+		},
+	})
+
+	// Rule 3: meta mark == AppleEgressMark && pure TCP SYN (Apple IPv4 & IPv6)
+	conn.AddRule(&nftables.Rule{
+		Table: table,
+		Chain: chain,
+		Exprs: []expr.Any{
+			&expr.Meta{Key: expr.MetaKeyMARK, Register: 1},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: binaryutil.NativeEndian.PutUint32(dialer.AppleEgressMark)},
 			&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
 			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{unix.IPPROTO_TCP}},
 			&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseTransportHeader, Offset: 13, Len: 1},
@@ -220,6 +238,7 @@ func (r *outboundSYNRewriter) handlePacket(family uint8, attrData []byte) {
 	var (
 		hasID   bool
 		pktID   uint32
+		pktMark uint32
 		payload []byte
 	)
 	for ad.Next() {
@@ -230,6 +249,11 @@ func (r *outboundSYNRewriter) handlePacket(family uint8, attrData []byte) {
 				pktID = binary.BigEndian.Uint32(b[0:4])
 				hasID = true
 			}
+		case nfqaMark:
+			b := ad.Bytes()
+			if len(b) >= 4 {
+				pktMark = binary.BigEndian.Uint32(b[0:4])
+			}
 		case nfqaPayload:
 			payload = ad.Bytes()
 		}
@@ -237,7 +261,15 @@ func (r *outboundSYNRewriter) handlePacket(family uint8, attrData []byte) {
 	if !hasID {
 		return
 	}
-	modified, ok := rewriteTCPSYNToWindows(payload)
+	var (
+		modified []byte
+		ok       bool
+	)
+	if pktMark == dialer.AppleEgressMark {
+		modified, ok = rewriteTCPSYNToApple(payload)
+	} else {
+		modified, ok = rewriteTCPSYNToWindows(payload)
+	}
 	if ok {
 		r.sendVerdict(family, pktID, modified)
 	} else {
@@ -286,53 +318,54 @@ func (r *outboundSYNRewriter) Close() error {
 	return err
 }
 
-// rewriteTCPSYNToWindows rewrites a Linux IPv4/IPv6 TCP SYN packet's TCP options
-// to native Windows 10/11 layout: MSS, NOP, WSCALE, NOP, NOP, SACK_PERM (12 bytes),
-// keeping the kernel-chosen MSS and WSCALE intact and recomputing IP + TCP checksums.
-func rewriteTCPSYNToWindows(pkt []byte) ([]byte, bool) {
+type parsedSYN struct {
+	l4Offset  int
+	isIPv6    bool
+	doff      int
+	hasMSS    bool
+	mss       uint16
+	hasWScale bool
+	wscale    uint8
+	hasSACK   bool
+	hasTS     bool
+	tsval     [4]byte
+}
+
+func parsePureTCPSYN(pkt []byte) (parsedSYN, bool) {
+	var res parsedSYN
 	if len(pkt) < 40 {
-		return nil, false
+		return res, false
 	}
 	version := pkt[0] >> 4
-	var (
-		l4Offset int
-		isIPv6   bool
-	)
 	switch version {
 	case 4:
 		ihl := int(pkt[0]&0x0f) * 4
 		if ihl < 20 || len(pkt) < ihl+20 || pkt[9] != unix.IPPROTO_TCP {
-			return nil, false
+			return res, false
 		}
-		l4Offset = ihl
+		res.l4Offset = ihl
 	case 6:
 		if len(pkt) < 60 || pkt[6] != unix.IPPROTO_TCP {
-			return nil, false
+			return res, false
 		}
-		l4Offset = 40
-		isIPv6 = true
+		res.l4Offset = 40
+		res.isIPv6 = true
 	default:
-		return nil, false
+		return res, false
 	}
 
-	tcpHdr := pkt[l4Offset:]
+	tcpHdr := pkt[res.l4Offset:]
 	doff := int(tcpHdr[12]>>4) * 4
 	if doff < 20 || len(tcpHdr) < doff {
-		return nil, false
+		return res, false
 	}
 	// Verify pure SYN (FIN=0, SYN=1, RST=0, ACK=0).
 	if (tcpHdr[13] & 0x17) != 0x02 {
-		return nil, false
+		return res, false
 	}
+	res.doff = doff
 
 	origOpts := tcpHdr[20:doff]
-	var (
-		hasMSS    bool
-		mss       uint16
-		hasWScale bool
-		wscale    uint8
-		hasSACK   bool
-	)
 	for i := 0; i < len(origOpts); {
 		kind := origOpts[i]
 		if kind == 0 {
@@ -352,74 +385,122 @@ func rewriteTCPSYNToWindows(pkt []byte) ([]byte, bool) {
 		switch kind {
 		case 2: // MSS
 			if optLen == 4 {
-				mss = binary.BigEndian.Uint16(origOpts[i+2 : i+4])
-				hasMSS = true
+				res.mss = binary.BigEndian.Uint16(origOpts[i+2 : i+4])
+				res.hasMSS = true
 			}
 		case 3: // Window Scale
 			if optLen == 3 {
-				wscale = origOpts[i+2]
-				hasWScale = true
+				res.wscale = origOpts[i+2]
+				res.hasWScale = true
 			}
 		case 4: // SACK Permitted
 			if optLen == 2 {
-				hasSACK = true
+				res.hasSACK = true
+			}
+		case 8: // Timestamps
+			if optLen == 10 {
+				copy(res.tsval[:], origOpts[i+2:i+6])
+				res.hasTS = true
 			}
 		}
 		i += optLen
 	}
-	if !hasMSS || !hasWScale {
+	return res, true
+}
+
+func rebuildTCPSYNPacket(pkt []byte, p parsedSYN, newOpts []byte, overrideWin uint16) []byte {
+	tcpHdr := pkt[p.l4Offset:]
+	tcpPayload := tcpHdr[p.doff:]
+	newTCPLen := 20 + len(newOpts) + len(tcpPayload)
+	out := make([]byte, p.l4Offset+newTCPLen)
+	copy(out[:p.l4Offset], pkt[:p.l4Offset])
+	copy(out[p.l4Offset:p.l4Offset+20], tcpHdr[:20])
+	copy(out[p.l4Offset+20:p.l4Offset+20+len(newOpts)], newOpts)
+	if len(tcpPayload) > 0 {
+		copy(out[p.l4Offset+20+len(newOpts):], tcpPayload)
+	}
+
+	// Set new TCP data offset, preserving reserved bits.
+	newDoffWords := byte((20 + len(newOpts)) / 4)
+	out[p.l4Offset+12] = (newDoffWords << 4) | (out[p.l4Offset+12] & 0x0f)
+	if overrideWin > 0 {
+		binary.BigEndian.PutUint16(out[p.l4Offset+14:p.l4Offset+16], overrideWin)
+	}
+	// Zero TCP checksum before recomputing.
+	out[p.l4Offset+16] = 0
+	out[p.l4Offset+17] = 0
+
+	if !p.isIPv6 {
+		binary.BigEndian.PutUint16(out[2:4], uint16(len(out)))
+		out[10] = 0
+		out[11] = 0
+		ipSum := internetChecksum(out[:p.l4Offset])
+		binary.BigEndian.PutUint16(out[10:12], ipSum)
+
+		tcpSum := tcpChecksumIPv4(out[12:16], out[16:20], out[p.l4Offset:])
+		binary.BigEndian.PutUint16(out[p.l4Offset+16:p.l4Offset+18], tcpSum)
+	} else {
+		binary.BigEndian.PutUint16(out[4:6], uint16(newTCPLen))
+		tcpSum := tcpChecksumIPv6(out[8:24], out[24:40], out[p.l4Offset:])
+		binary.BigEndian.PutUint16(out[p.l4Offset+16:p.l4Offset+18], tcpSum)
+	}
+	return out
+}
+
+// rewriteTCPSYNToWindows rewrites a Linux IPv4/IPv6 TCP SYN packet's TCP options
+// to native Windows 10/11 layout: MSS, NOP, WSCALE, NOP, NOP, SACK_PERM (12 bytes),
+// keeping the kernel-chosen MSS and WSCALE intact and recomputing IP + TCP checksums.
+func rewriteTCPSYNToWindows(pkt []byte) ([]byte, bool) {
+	p, ok := parsePureTCPSYN(pkt)
+	if !ok || !p.hasMSS || !p.hasWScale {
 		return nil, false
 	}
 
 	// Native Windows 10/11 12-byte TCP SYN option layout:
-	//   [0..3]  MSS (kind=2, len=4, mss)
-	//   [4]     NOP (kind=1)
-	//   [5..7]  Window Scale (kind=3, len=3, wscale)
-	//   [8..9]  NOP, NOP (kind=1, kind=1)
+	//   [0..3]   MSS (kind=2, len=4, mss)
+	//   [4]      NOP (kind=1)
+	//   [5..7]   Window Scale (kind=3, len=3, wscale)
+	//   [8..9]   NOP, NOP (kind=1, kind=1)
 	//   [10..11] SACK Permitted (kind=4, len=2) or NOP, NOP
 	winOpts := [12]byte{
-		0x02, 0x04, byte(mss >> 8), byte(mss),
+		0x02, 0x04, byte(p.mss >> 8), byte(p.mss),
 		0x01,
-		0x03, 0x03, wscale,
+		0x03, 0x03, p.wscale,
 		0x01, 0x01,
 		0x01, 0x01,
 	}
-	if hasSACK {
+	if p.hasSACK {
 		winOpts[10] = 0x04
 		winOpts[11] = 0x02
 	}
+	return rebuildTCPSYNPacket(pkt, p, winOpts[:], 0), true
+}
 
-	tcpPayload := tcpHdr[doff:]
-	newTCPLen := 20 + len(winOpts) + len(tcpPayload)
-	out := make([]byte, l4Offset+newTCPLen)
-	copy(out[:l4Offset], pkt[:l4Offset])
-	copy(out[l4Offset:l4Offset+20], tcpHdr[:20])
-	copy(out[l4Offset+20:l4Offset+32], winOpts[:])
-	if len(tcpPayload) > 0 {
-		copy(out[l4Offset+32:], tcpPayload)
+// rewriteTCPSYNToApple rewrites a Linux IPv4/IPv6 TCP SYN packet's window and
+// TCP options to native Apple XNU (macOS / iOS) layout:
+//   WIN=65535 + MSS(orig), NOP, WSCALE(orig=6), NOP, NOP, TS(orig_tsval, 0),
+//   SACK_PERM, EOL, EOL (24 bytes, DOFF=44)
+// Preserving kernel MSS, WSCALE, SACK, and TSval prevents any TCP state desync.
+func rewriteTCPSYNToApple(pkt []byte) ([]byte, bool) {
+	p, ok := parsePureTCPSYN(pkt)
+	if !ok || !p.hasMSS || !p.hasWScale || !p.hasTS {
+		return nil, false
 	}
 
-	// Set new TCP data offset = 8 (32 bytes), preserving reserved bits.
-	out[l4Offset+12] = (8 << 4) | (out[l4Offset+12] & 0x0f)
-	// Zero TCP checksum before recomputing.
-	out[l4Offset+16] = 0
-	out[l4Offset+17] = 0
-
-	if !isIPv6 {
-		binary.BigEndian.PutUint16(out[2:4], uint16(len(out)))
-		out[10] = 0
-		out[11] = 0
-		ipSum := internetChecksum(out[:l4Offset])
-		binary.BigEndian.PutUint16(out[10:12], ipSum)
-
-		tcpSum := tcpChecksumIPv4(out[12:16], out[16:20], out[l4Offset:])
-		binary.BigEndian.PutUint16(out[l4Offset+16:l4Offset+18], tcpSum)
-	} else {
-		binary.BigEndian.PutUint16(out[4:6], uint16(newTCPLen))
-		tcpSum := tcpChecksumIPv6(out[8:24], out[24:40], out[l4Offset:])
-		binary.BigEndian.PutUint16(out[l4Offset+16:l4Offset+18], tcpSum)
+	appleOpts := [24]byte{
+		0x02, 0x04, byte(p.mss >> 8), byte(p.mss),
+		0x01,
+		0x03, 0x03, p.wscale,
+		0x01, 0x01,
+		0x08, 0x0a, p.tsval[0], p.tsval[1], p.tsval[2], p.tsval[3], 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00,
+		0x00, 0x00,
 	}
-	return out, true
+	if p.hasSACK {
+		appleOpts[20] = 0x04
+		appleOpts[21] = 0x02
+	}
+	return rebuildTCPSYNPacket(pkt, p, appleOpts[:], 65535), true
 }
 
 func checksumAdd(sum uint32, b []byte) uint32 {

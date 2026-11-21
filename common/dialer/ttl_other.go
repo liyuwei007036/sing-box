@@ -7,3 +7,7 @@ import "github.com/sagernet/sing/common/control"
 func setInitialTTL(int) control.Func {
 	return nil
 }
+
+func setAppleEgress(bool) control.Func {
+	return nil
+}

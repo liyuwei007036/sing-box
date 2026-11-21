@@ -3,7 +3,6 @@ package v2ray
 import (
 	"context"
 	"net"
-	"sync"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/dialer"
@@ -12,10 +11,8 @@ import (
 )
 
 type ttlSplitClientTransport struct {
-	base   adapter.V2RayClientTransport
-	winMu  sync.Mutex
-	win    adapter.V2RayClientTransport
-	newWin func() (adapter.V2RayClientTransport, error)
+	base    adapter.V2RayClientTransport
+	ttlPool dialer.TTLClientPool[adapter.V2RayClientTransport]
 }
 
 var (
@@ -33,32 +30,19 @@ func wrapMultiplexClientTransport(
 	if base == nil {
 		return nil
 	}
-	return &ttlSplitClientTransport{
-		base: base,
-		newWin: func() (adapter.V2RayClientTransport, error) {
-			var winTLS tls.Config
-			if tlsConfig != nil {
-				winTLS = tlsConfig.Clone()
-			}
-			return factory(dialer.WrapWithInitialTTL(d, dialer.WindowsInitialTTL), winTLS)
-		},
-	}
+	t := &ttlSplitClientTransport{base: base}
+	t.ttlPool.Init(func(ttl int) (adapter.V2RayClientTransport, error) {
+		var clonedTLS tls.Config
+		if tlsConfig != nil {
+			clonedTLS = tlsConfig.Clone()
+		}
+		return factory(dialer.WrapWithInitialTTL(d, ttl), clonedTLS)
+	})
+	return t
 }
 
 func (t *ttlSplitClientTransport) selectTransport(ctx context.Context) (adapter.V2RayClientTransport, error) {
-	if !dialer.IsWindowsTTLContext(ctx) || t.newWin == nil {
-		return t.base, nil
-	}
-	t.winMu.Lock()
-	defer t.winMu.Unlock()
-	if t.win == nil {
-		w, err := t.newWin()
-		if err != nil {
-			return nil, err
-		}
-		t.win = w
-	}
-	return t.win, nil
+	return t.ttlPool.Get(ctx, t.base)
 }
 
 func (t *ttlSplitClientTransport) DialContext(ctx context.Context) (net.Conn, error) {
@@ -80,39 +64,31 @@ func (t *ttlSplitClientTransport) SetKeepIdleConnections(keep bool) {
 	if k, ok := t.base.(adapter.IdleConnectionKeeper); ok {
 		k.SetKeepIdleConnections(keep)
 	}
-	t.winMu.Lock()
-	win := t.win
-	t.winMu.Unlock()
-	if win != nil {
-		if k, ok := win.(adapter.IdleConnectionKeeper); ok {
+	t.ttlPool.ForEach(func(tr adapter.V2RayClientTransport) {
+		if k, ok := tr.(adapter.IdleConnectionKeeper); ok {
 			k.SetKeepIdleConnections(keep)
 		}
-	}
+	})
 }
 
 func (t *ttlSplitClientTransport) CloseIdleConnections() {
 	if k, ok := t.base.(adapter.IdleConnectionKeeper); ok {
 		k.CloseIdleConnections()
 	}
-	t.winMu.Lock()
-	win := t.win
-	t.winMu.Unlock()
-	if win != nil {
-		if k, ok := win.(adapter.IdleConnectionKeeper); ok {
+	t.ttlPool.ForEach(func(tr adapter.V2RayClientTransport) {
+		if k, ok := tr.(adapter.IdleConnectionKeeper); ok {
 			k.CloseIdleConnections()
 		}
-	}
+	})
 }
 
 func (t *ttlSplitClientTransport) Close() error {
 	err := t.base.Close()
-	t.winMu.Lock()
-	win := t.win
-	t.win = nil
-	t.winMu.Unlock()
-	if win != nil {
-		if winErr := win.Close(); winErr != nil && err == nil {
-			err = winErr
+	for _, tr := range t.ttlPool.TakeAll() {
+		if tr != nil {
+			if trErr := tr.Close(); trErr != nil && err == nil {
+				err = trErr
+			}
 		}
 	}
 	return err

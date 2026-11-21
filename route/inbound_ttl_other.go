@@ -14,8 +14,8 @@ func newInboundTTLObserver(log.ContextLogger) (*inboundTTLObserver, error) {
 	return nil, nil
 }
 
-func (*inboundTTLObserver) IsWindowsSource(string, netip.Addr, uint16) bool {
-	return false
+func (*inboundTTLObserver) LookupOSProfile(string, netip.Addr, uint16) inboundOSProfile {
+	return inboundOSUnknown
 }
 
 func (*inboundTTLObserver) Group() uint16 {

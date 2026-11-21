@@ -4,7 +4,6 @@ import (
 	"context"
 	"net"
 	"os"
-	"sync"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -39,12 +38,10 @@ var (
 
 type Outbound struct {
 	outbound.Adapter
-	logger       logger.ContextLogger
-	client       *tuic.Client
-	winMu        sync.Mutex
-	winClient    *tuic.Client
-	newWinClient func() (*tuic.Client, error)
-	udpStream    bool
+	logger    logger.ContextLogger
+	client    *tuic.Client
+	ttlPool   dialer.TTLClientPool[*tuic.Client]
+	udpStream bool
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.TUICOutboundOptions) (adapter.Outbound, error) {
@@ -97,34 +94,23 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	if err != nil {
 		return nil, err
 	}
-	return &Outbound{
-		Adapter: outbound.NewAdapterWithDialerOptions(C.TypeTUIC, tag, options.Network.Build(), options.DialerOptions),
-		logger:  logger,
-		client:  client,
-		newWinClient: func() (*tuic.Client, error) {
-			winOptions := clientOptions
-			winOptions.TLSConfig = tlsConfig.Clone()
-			winOptions.Dialer = dialer.WrapWithInitialTTL(outboundDialer, dialer.WindowsInitialTTL)
-			return tuic.NewClient(winOptions)
-		},
+	out := &Outbound{
+		Adapter:   outbound.NewAdapterWithDialerOptions(C.TypeTUIC, tag, options.Network.Build(), options.DialerOptions),
+		logger:    logger,
+		client:    client,
 		udpStream: options.UDPOverStream,
-	}, nil
+	}
+	out.ttlPool.Init(func(ttl int) (*tuic.Client, error) {
+		ttlOptions := clientOptions
+		ttlOptions.TLSConfig = tlsConfig.Clone()
+		ttlOptions.Dialer = dialer.WrapWithInitialTTL(outboundDialer, ttl)
+		return tuic.NewClient(ttlOptions)
+	})
+	return out, nil
 }
 
 func (h *Outbound) selectClient(ctx context.Context) (*tuic.Client, error) {
-	if !dialer.IsWindowsTTLContext(ctx) || h.newWinClient == nil {
-		return h.client, nil
-	}
-	h.winMu.Lock()
-	defer h.winMu.Unlock()
-	if h.winClient == nil {
-		c, err := h.newWinClient()
-		if err != nil {
-			return nil, err
-		}
-		h.winClient = c
-	}
-	return h.winClient, nil
+	return h.ttlPool.Get(ctx, h.client)
 }
 
 func (h *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
@@ -186,12 +172,9 @@ func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 
 func (h *Outbound) InterfaceUpdated(ctx context.Context) {
 	_ = h.client.CloseWithError(E.New("network changed"))
-	h.winMu.Lock()
-	winClient := h.winClient
-	h.winMu.Unlock()
-	if winClient != nil {
-		_ = winClient.CloseWithError(E.New("network changed"))
-	}
+	h.ttlPool.ForEach(func(c *tuic.Client) {
+		_ = c.CloseWithError(E.New("network changed"))
+	})
 }
 
 func (h *Outbound) MultiplexEnabled() bool {
@@ -200,22 +183,16 @@ func (h *Outbound) MultiplexEnabled() bool {
 
 func (h *Outbound) SetKeepIdleConnections(keep bool) {
 	h.client.SetKeepIdleConnections(keep)
-	h.winMu.Lock()
-	winClient := h.winClient
-	h.winMu.Unlock()
-	if winClient != nil {
-		winClient.SetKeepIdleConnections(keep)
-	}
+	h.ttlPool.ForEach(func(c *tuic.Client) {
+		c.SetKeepIdleConnections(keep)
+	})
 }
 
 func (h *Outbound) CloseIdleConnections() {
 	h.client.CloseIdleConnections()
-	h.winMu.Lock()
-	winClient := h.winClient
-	h.winMu.Unlock()
-	if winClient != nil {
-		winClient.CloseIdleConnections()
-	}
+	h.ttlPool.ForEach(func(c *tuic.Client) {
+		c.CloseIdleConnections()
+	})
 }
 
 func (h *Outbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
@@ -224,13 +201,11 @@ func (h *Outbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	}
 	scope.Add(func() error {
 		err := h.client.CloseWithError(os.ErrClosed)
-		h.winMu.Lock()
-		winClient := h.winClient
-		h.winClient = nil
-		h.winMu.Unlock()
-		if winClient != nil {
-			if winErr := winClient.CloseWithError(os.ErrClosed); winErr != nil && err == nil {
-				err = winErr
+		for _, c := range h.ttlPool.TakeAll() {
+			if c != nil {
+				if cErr := c.CloseWithError(os.ErrClosed); cErr != nil && err == nil {
+					err = cErr
+				}
 			}
 		}
 		return err

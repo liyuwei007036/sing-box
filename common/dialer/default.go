@@ -39,6 +39,7 @@ type DefaultDialer struct {
 	udpAddr4               string
 	udpAddr6               string
 	netns                  string
+	hasCustomMark          bool
 	autoDetectBindFunc     control.Func
 	connectionManager      adapter.ConnectionManager
 	networkManager         adapter.NetworkManager
@@ -231,6 +232,7 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 	}
 	tcpDialer4 := tfo.Dialer{Dialer: dialer4, DisableTFO: !options.TCPFastOpen}
 	tcpDialer6 := tfo.Dialer{Dialer: dialer6, DisableTFO: !options.TCPFastOpen}
+	hasCustomMark := options.RoutingMark > 0 || (networkManager != nil && networkManager.DefaultOptions().RoutingMark != 0)
 	return &DefaultDialer{
 		dialer4:                tcpDialer4,
 		dialer6:                tcpDialer6,
@@ -240,6 +242,7 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 		udpAddr4:               udpAddr4,
 		udpAddr6:               udpAddr6,
 		netns:                  options.NetNs,
+		hasCustomMark:          hasCustomMark,
 		autoDetectBindFunc:     autoDetectBindFunc,
 		connectionManager:      connectionManager,
 		networkManager:         networkManager,
@@ -270,6 +273,17 @@ func setMarkWrapper(networkManager adapter.NetworkManager, mark uint32, isDefaul
 	}
 }
 
+func (d *DefaultDialer) ttlControlFunc(ctx context.Context) control.Func {
+	if ttl := InitialTTLFromContext(ctx); ttl > 0 {
+		return setInitialTTL(ttl)
+	}
+	if IsAppleEgressContext(ctx) {
+		canMark := !d.hasCustomMark && (d.networkManager == nil || d.networkManager.AutoRedirectOutputMark() == 0)
+		return setAppleEgress(canMark)
+	}
+	return nil
+}
+
 func (d *DefaultDialer) DialContext(ctx context.Context, network string, address M.Socksaddr) (net.Conn, error) {
 	if !address.IsValid() {
 		return nil, E.New("invalid address")
@@ -277,7 +291,7 @@ func (d *DefaultDialer) DialContext(ctx context.Context, network string, address
 		return nil, E.New("domain not resolved")
 	}
 	if d.networkStrategy == nil {
-		ttlFunc := setInitialTTL(InitialTTLFromContext(ctx))
+		ttlFunc := d.ttlControlFunc(ctx)
 		conn, err := listener.ListenNetworkNamespace[net.Conn](ctx, d.netns, func() (net.Conn, error) {
 			switch N.NetworkName(network) {
 			case N.NetworkUDP:
@@ -341,7 +355,7 @@ func (d *DefaultDialer) DialParallelInterface(ctx context.Context, network strin
 	} else {
 		dialer = d.udpDialer4
 	}
-	if ttlFunc := setInitialTTL(InitialTTLFromContext(ctx)); ttlFunc != nil {
+	if ttlFunc := d.ttlControlFunc(ctx); ttlFunc != nil {
 		dialer.Control = control.Append(dialer.Control, ttlFunc)
 	}
 	fastFallback := time.Since(d.networkLastFallback.Load()) < C.TCPTimeout

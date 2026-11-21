@@ -46,7 +46,7 @@ func extractOptionKinds(opts []byte) ([]byte, uint8) {
 	return kinds, wscale
 }
 
-func TestOutboundSYNRewriterWindowsFingerprint(t *testing.T) {
+func TestOutboundSYNRewriterThreeOSFingerprints(t *testing.T) {
 	obs, err := newInboundTTLObserver(log.NewNOPFactory().Logger())
 	if err != nil {
 		t.Fatalf("newInboundTTLObserver: %v", err)
@@ -140,33 +140,37 @@ func TestOutboundSYNRewriterWindowsFingerprint(t *testing.T) {
 	}
 	dst := M.ParseSocksaddr(ln.Addr().String())
 
-	// 1. Windows flow (TTL=128): must rewrite TCP SYN options to native Windows 10/11
-	//    layout [2, 1, 3, 1, 1, 4] (MSS, NOP, WS=8, NOP, NOP, SACK_PERM) with NO TS,
-	//    and full bidirectional TCP echo must succeed.
-	ctxWin := dialer.WithInitialTTL(context.Background(), dialer.WindowsInitialTTL)
-	cWin, err := d.DialContext(ctxWin, "tcp", dst)
-	if err != nil {
-		t.Fatalf("win dial: %v", err)
-	}
-	msg := []byte("hello-windows-syn-fingerprint")
-	if _, err := cWin.Write(msg); err != nil {
-		t.Fatalf("win write: %v", err)
-	}
-	echo := make([]byte, len(msg))
-	if _, err := io.ReadFull(cWin, echo); err != nil {
-		t.Fatalf("win read echo: %v", err)
-	}
-	_ = cWin.Close()
-	if !bytes.Equal(echo, msg) {
-		t.Fatalf("echo mismatch: got %q want %q", echo, msg)
+	dialAndEcho := func(ctx context.Context, payload string) capturedSYN {
+		t.Helper()
+		c, err := d.DialContext(ctx, "tcp", dst)
+		if err != nil {
+			t.Fatalf("dial (%s): %v", payload, err)
+		}
+		msg := []byte(payload)
+		if _, err := c.Write(msg); err != nil {
+			_ = c.Close()
+			t.Fatalf("write (%s): %v", payload, err)
+		}
+		echo := make([]byte, len(msg))
+		if _, err := io.ReadFull(c, echo); err != nil {
+			_ = c.Close()
+			t.Fatalf("read echo (%s): %v", payload, err)
+		}
+		_ = c.Close()
+		if !bytes.Equal(echo, msg) {
+			t.Fatalf("echo mismatch: got %q want %q", echo, msg)
+		}
+		select {
+		case syn := <-capturedCh:
+			return syn
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timeout waiting for captured SYN (%s)", payload)
+			return capturedSYN{}
+		}
 	}
 
-	var winSYN capturedSYN
-	select {
-	case winSYN = <-capturedCh:
-	case <-time.After(2 * time.Second):
-		t.Fatalf("timeout waiting for captured Windows SYN")
-	}
+	// 1. Windows flow: TTL=128, DOFF=32, KINDS=[2,1,3,1,1,4] (no TS), WSCALE=8
+	winSYN := dialAndEcho(dialer.WithInitialTTL(context.Background(), dialer.WindowsInitialTTL), "hello-windows-syn")
 	wantWinKinds := []byte{2, 1, 3, 1, 1, 4}
 	if winSYN.ttl != 128 || winSYN.doff != 32 || !bytes.Equal(winSYN.kinds, wantWinKinds) || winSYN.wscale != 8 {
 		t.Fatalf("Windows SYN mismatch: ttl=%d doff=%d win=%d kinds=%v ws=%d (want ttl=128 doff=32 kinds=%v ws=8)",
@@ -175,22 +179,22 @@ func TestOutboundSYNRewriterWindowsFingerprint(t *testing.T) {
 	t.Logf("VERIFIED Windows SYN: TTL=%d DOFF=%d WIN=%d KINDS=%v WSCALE=%d",
 		winSYN.ttl, winSYN.doff, winSYN.win, winSYN.kinds, winSYN.wscale)
 
-	// 2. Linux flow (TTL=64): must remain completely untouched (keeps Linux TS option 8).
-	cLin, err := d.DialContext(context.Background(), "tcp", dst)
-	if err != nil {
-		t.Fatalf("linux dial: %v", err)
+	// 2. Apple macOS/iOS flow: TTL=64, DOFF=44, WIN=65535, KINDS=[2,1,3,1,1,8,4,0], WSCALE=6
+	appleSYN := dialAndEcho(dialer.WithAppleEgress(context.Background()), "hello-apple-xnu-syn")
+	wantAppleKinds := []byte{2, 1, 3, 1, 1, 8, 4, 0}
+	if appleSYN.ttl != 64 || appleSYN.doff != 44 || appleSYN.win != 65535 || !bytes.Equal(appleSYN.kinds, wantAppleKinds) || appleSYN.wscale != 6 {
+		t.Fatalf("Apple SYN mismatch: ttl=%d doff=%d win=%d kinds=%v ws=%d (want ttl=64 doff=44 win=65535 kinds=%v ws=6)",
+			appleSYN.ttl, appleSYN.doff, appleSYN.win, appleSYN.kinds, appleSYN.wscale, wantAppleKinds)
 	}
-	_ = cLin.Close()
+	t.Logf("VERIFIED Apple XNU SYN: TTL=%d DOFF=%d WIN=%d KINDS=%v WSCALE=%d",
+		appleSYN.ttl, appleSYN.doff, appleSYN.win, appleSYN.kinds, appleSYN.wscale)
 
-	var linSYN capturedSYN
-	select {
-	case linSYN = <-capturedCh:
-	case <-time.After(2 * time.Second):
-		t.Fatalf("timeout waiting for captured Linux SYN")
-	}
-	if linSYN.ttl != 64 || !bytes.Contains(linSYN.kinds, []byte{8}) {
-		t.Fatalf("Linux SYN unexpectedly modified: ttl=%d doff=%d kinds=%v ws=%d",
-			linSYN.ttl, linSYN.doff, linSYN.kinds, linSYN.wscale)
+	// 3. Linux/Android flow: TTL=64, DOFF=40, untouched Linux options [2,4,8,1,3]
+	linSYN := dialAndEcho(context.Background(), "hello-linux-syn")
+	wantLinuxKinds := []byte{2, 4, 8, 1, 3}
+	if linSYN.ttl != 64 || linSYN.doff != 40 || !bytes.Equal(linSYN.kinds, wantLinuxKinds) {
+		t.Fatalf("Linux SYN unexpectedly modified: ttl=%d doff=%d win=%d kinds=%v ws=%d",
+			linSYN.ttl, linSYN.doff, linSYN.win, linSYN.kinds, linSYN.wscale)
 	}
 	t.Logf("VERIFIED Linux SYN untouched: TTL=%d DOFF=%d WIN=%d KINDS=%v WSCALE=%d",
 		linSYN.ttl, linSYN.doff, linSYN.win, linSYN.kinds, linSYN.wscale)

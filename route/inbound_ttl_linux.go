@@ -41,13 +41,16 @@ const (
 
 	inboundTTLGroupBase   = 128
 	inboundTTLGroupMax    = 159
-	inboundTTLSnaplen     = 64
+	inboundTTLSnaplen     = 128 // fits IPv6 (40B) + Apple TCP SYN (44B) comfortably
 	inboundTTLEntryIdle   = 30 * time.Minute
 	inboundTTLMaxEntries  = 65536
 	inboundTTLMissWait    = 10 * time.Millisecond
 	inboundTTLNftPriority = nftables.ChainPriority(10) // after host firewall filter input (priority 0)
 	windowsMinObservedTTL = 65
 	windowsMaxObservedTTL = 128
+	linuxMinObservedTTL   = 129
+	linuxMaxObservedTTL   = 192
+	appleMinObservedTTL   = 193
 )
 
 type inboundTTLKey struct {
@@ -57,7 +60,7 @@ type inboundTTLKey struct {
 }
 
 type inboundTTLEntry struct {
-	ttl      uint8
+	profile  inboundOSProfile
 	lastSeen atomic.Int64
 }
 
@@ -111,7 +114,7 @@ func newInboundTTLObserver(logger log.ContextLogger) (*inboundTTLObserver, error
 
 	synRW, synErr := newOutboundSYNRewriter(logger, boundGroup)
 	if synErr != nil && logger != nil {
-		logger.Warn("outbound Windows SYN option rewriter unavailable (falling back to TTL-only): ", synErr)
+		logger.Warn("outbound SYN option rewriter unavailable (falling back to TTL-only): ", synErr)
 	}
 
 	tableName := fmt.Sprintf("sing_box_ttl_%d", boundGroup)
@@ -306,40 +309,106 @@ func (o *inboundTTLObserver) handlePacketAttributes(attrData []byte) {
 	}
 	for ad.Next() {
 		if ad.Type() == nfulaPayload {
-			if key, ttl, ok := parseL3PacketSourceTTL(ad.Bytes()); ok {
-				o.record(key, ttl)
+			if key, profile, ok := parseL3PacketSourceProfile(ad.Bytes()); ok {
+				o.record(key, profile)
 			}
 		}
 	}
 }
 
-func parseL3PacketSourceTTL(pkt []byte) (inboundTTLKey, uint8, bool) {
+// isAppleTCPSYNOptions reports whether a TCP header carries the characteristic
+// Apple XNU (macOS / iOS / iPadOS) SYN option prefix:
+// MSS(2), NOP(1), WS(3), NOP(1), NOP(1), TS(8) [, SACK_PERM(4), EOL(0), EOL(0)].
+func isAppleTCPSYNOptions(tcpHeader []byte) bool {
+	if len(tcpHeader) < 20 {
+		return false
+	}
+	// Require pure SYN (SYN=1, ACK=0).
+	if (tcpHeader[13] & 0x12) != 0x02 {
+		return false
+	}
+	dataOffset := int(tcpHeader[12]>>4) * 4
+	if dataOffset <= 20 {
+		return false
+	}
+	if dataOffset > len(tcpHeader) {
+		dataOffset = len(tcpHeader)
+	}
+	opts := tcpHeader[20:dataOffset]
+	want := [6]byte{2, 1, 3, 1, 1, 8}
+	matched := 0
+	for i := 0; i < len(opts) && matched < len(want); {
+		kind := opts[i]
+		if kind == 0 || kind != want[matched] {
+			return false
+		}
+		matched++
+		if kind == 1 {
+			i++
+			continue
+		}
+		if i+1 >= len(opts) {
+			return false
+		}
+		optLen := int(opts[i+1])
+		if optLen < 2 || i+optLen > len(opts) {
+			return false
+		}
+		i += optLen
+	}
+	return matched == len(want)
+}
+
+func classifyInboundOSProfile(ttl uint8, proto uint8, l4 []byte) inboundOSProfile {
+	switch {
+	case ttl >= windowsMinObservedTTL && ttl <= windowsMaxObservedTTL:
+		return inboundOSWindows
+	case ttl >= appleMinObservedTTL:
+		return inboundOSApple
+	case ttl >= linuxMinObservedTTL && ttl <= linuxMaxObservedTTL:
+		return inboundOSLinux
+	case proto == unix.IPPROTO_TCP:
+		if isAppleTCPSYNOptions(l4) {
+			return inboundOSApple
+		}
+		return inboundOSLinux
+	case proto == unix.IPPROTO_UDP:
+		// Direct pure-UDP flows with TTL<=64 carry no TCP options and share TTL=64
+		// between iOS/macOS and Android; fall back to Apple (macOS/iOS) as requested.
+		return inboundOSApple
+	default:
+		return inboundOSLinux
+	}
+}
+
+func parseL3PacketSourceProfile(pkt []byte) (inboundTTLKey, inboundOSProfile, bool) {
 	if len(pkt) < 20 {
-		return inboundTTLKey{}, 0, false
+		return inboundTTLKey{}, inboundOSUnknown, false
 	}
 	version := pkt[0] >> 4
 	switch version {
 	case 4:
 		ihl := int(pkt[0]&0x0f) * 4
 		if ihl < 20 || len(pkt) < ihl+2 {
-			return inboundTTLKey{}, 0, false
+			return inboundTTLKey{}, inboundOSUnknown, false
 		}
 		proto := pkt[9]
 		if proto != unix.IPPROTO_TCP && proto != unix.IPPROTO_UDP {
-			return inboundTTLKey{}, 0, false
+			return inboundTTLKey{}, inboundOSUnknown, false
 		}
 		ttl := pkt[8]
 		var ip4 [4]byte
 		copy(ip4[:], pkt[12:16])
 		srcPort := binary.BigEndian.Uint16(pkt[ihl : ihl+2])
+		profile := classifyInboundOSProfile(ttl, proto, pkt[ihl:])
 		return inboundTTLKey{
 			proto:   proto,
 			srcIP:   netip.AddrFrom4(ip4),
 			srcPort: srcPort,
-		}, ttl, true
+		}, profile, true
 	case 6:
 		if len(pkt) < 42 {
-			return inboundTTLKey{}, 0, false
+			return inboundTTLKey{}, inboundOSUnknown, false
 		}
 		hopLimit := pkt[7]
 		nextHdr := pkt[6]
@@ -352,41 +421,42 @@ func parseL3PacketSourceTTL(pkt []byte) (inboundTTLKey, uint8, bool) {
 			switch nextHdr {
 			case unix.IPPROTO_HOPOPTS, unix.IPPROTO_ROUTING, unix.IPPROTO_DSTOPTS:
 				if len(pkt) < offset+2 {
-					return inboundTTLKey{}, 0, false
+					return inboundTTLKey{}, inboundOSUnknown, false
 				}
 				nextHdr = pkt[offset]
 				offset += (int(pkt[offset+1]) + 1) * 8
 			case unix.IPPROTO_FRAGMENT:
 				if len(pkt) < offset+8 {
-					return inboundTTLKey{}, 0, false
+					return inboundTTLKey{}, inboundOSUnknown, false
 				}
 				nextHdr = pkt[offset]
 				offset += 8
 			default:
-				return inboundTTLKey{}, 0, false
+				return inboundTTLKey{}, inboundOSUnknown, false
 			}
 		}
 		if (nextHdr != unix.IPPROTO_TCP && nextHdr != unix.IPPROTO_UDP) || len(pkt) < offset+2 {
-			return inboundTTLKey{}, 0, false
+			return inboundTTLKey{}, inboundOSUnknown, false
 		}
 		var ip6 [16]byte
 		copy(ip6[:], pkt[8:24])
 		srcPort := binary.BigEndian.Uint16(pkt[offset : offset+2])
+		profile := classifyInboundOSProfile(hopLimit, nextHdr, pkt[offset:])
 		return inboundTTLKey{
 			proto:   nextHdr,
 			srcIP:   netip.AddrFrom16(ip6).Unmap(),
 			srcPort: srcPort,
-		}, hopLimit, true
+		}, profile, true
 	default:
-		return inboundTTLKey{}, 0, false
+		return inboundTTLKey{}, inboundOSUnknown, false
 	}
 }
 
-func (o *inboundTTLObserver) record(key inboundTTLKey, ttl uint8) {
+func (o *inboundTTLObserver) record(key inboundTTLKey, profile inboundOSProfile) {
 	now := time.Now().UnixNano()
 	o.mu.RLock()
 	entry, ok := o.entries[key]
-	if ok && entry.ttl == ttl {
+	if ok && entry.profile == profile {
 		entry.lastSeen.Store(now)
 		o.mu.RUnlock()
 		return
@@ -395,13 +465,13 @@ func (o *inboundTTLObserver) record(key inboundTTLKey, ttl uint8) {
 
 	o.mu.Lock()
 	if existing, ok := o.entries[key]; ok {
-		existing.ttl = ttl
+		existing.profile = profile
 		existing.lastSeen.Store(now)
 	} else {
 		if len(o.entries) >= inboundTTLMaxEntries {
 			o.evictLocked(now)
 		}
-		e := &inboundTTLEntry{ttl: ttl}
+		e := &inboundTTLEntry{profile: profile}
 		e.lastSeen.Store(now)
 		o.entries[key] = e
 	}
@@ -412,26 +482,26 @@ func (o *inboundTTLObserver) record(key inboundTTLKey, ttl uint8) {
 	o.mu.Unlock()
 }
 
-func (o *inboundTTLObserver) lookupOnce(proto uint8, srcIP netip.Addr, srcPort uint16) (uint8, bool, <-chan struct{}) {
+func (o *inboundTTLObserver) lookupOnce(proto uint8, srcIP netip.Addr, srcPort uint16) (inboundOSProfile, bool, <-chan struct{}) {
 	key := inboundTTLKey{proto: proto, srcIP: srcIP, srcPort: srcPort}
 	o.mu.RLock()
 	entry, ok := o.entries[key]
 	notify := o.notifyCh
 	if ok {
-		ttl := entry.ttl
+		profile := entry.profile
 		entry.lastSeen.Store(time.Now().UnixNano())
 		o.mu.RUnlock()
-		return ttl, true, nil
+		return profile, true, nil
 	}
 	o.mu.RUnlock()
-	return 0, false, notify
+	return inboundOSUnknown, false, notify
 }
 
-// IsWindowsSource reports whether the outer transport flow for (srcIP, srcPort)
-// arrived with a Windows-range IP TTL / Hop Limit (65..128).
-func (o *inboundTTLObserver) IsWindowsSource(inboundType string, srcIP netip.Addr, srcPort uint16) bool {
+// LookupOSProfile returns the inferred originating OS profile for the outer
+// transport flow (srcIP, srcPort).
+func (o *inboundTTLObserver) LookupOSProfile(inboundType string, srcIP netip.Addr, srcPort uint16) inboundOSProfile {
 	if o == nil || !srcIP.IsValid() || srcPort == 0 {
-		return false
+		return inboundOSUnknown
 	}
 	srcIP = srcIP.Unmap()
 
@@ -441,22 +511,22 @@ func (o *inboundTTLObserver) IsWindowsSource(inboundType string, srcIP netip.Add
 		firstProto, secondProto = unix.IPPROTO_UDP, unix.IPPROTO_TCP
 	}
 
-	if ttl, ok, _ := o.lookupOnce(firstProto, srcIP, srcPort); ok {
-		return isWindowsObservedTTL(ttl)
+	if profile, ok, _ := o.lookupOnce(firstProto, srcIP, srcPort); ok {
+		return profile
 	}
-	if ttl, ok, notify := o.lookupOnce(secondProto, srcIP, srcPort); ok {
-		return isWindowsObservedTTL(ttl)
+	if profile, ok, notify := o.lookupOnce(secondProto, srcIP, srcPort); ok {
+		return profile
 	} else if notify != nil {
 		// On ultra-low-latency links (e.g. loopback / LAN), the userspace accept
 		// can briefly outrun the NFLOG goroutine. Wait briefly for arrival.
 		o.waiters.Add(1)
 		defer o.waiters.Add(-1)
 		// Re-check after registering waiter to avoid missing a concurrent record().
-		if ttl, ok, _ := o.lookupOnce(firstProto, srcIP, srcPort); ok {
-			return isWindowsObservedTTL(ttl)
+		if profile, ok, _ := o.lookupOnce(firstProto, srcIP, srcPort); ok {
+			return profile
 		}
-		if ttl, ok, nextNotify := o.lookupOnce(secondProto, srcIP, srcPort); ok {
-			return isWindowsObservedTTL(ttl)
+		if profile, ok, nextNotify := o.lookupOnce(secondProto, srcIP, srcPort); ok {
+			return profile
 		} else {
 			notify = nextNotify
 		}
@@ -465,26 +535,22 @@ func (o *inboundTTLObserver) IsWindowsSource(inboundType string, srcIP netip.Add
 		for {
 			select {
 			case <-notify:
-				if ttl, ok, _ := o.lookupOnce(firstProto, srcIP, srcPort); ok {
-					return isWindowsObservedTTL(ttl)
+				if profile, ok, _ := o.lookupOnce(firstProto, srcIP, srcPort); ok {
+					return profile
 				}
-				if ttl, ok, nextNotify := o.lookupOnce(secondProto, srcIP, srcPort); ok {
-					return isWindowsObservedTTL(ttl)
+				if profile, ok, nextNotify := o.lookupOnce(secondProto, srcIP, srcPort); ok {
+					return profile
 				} else {
 					notify = nextNotify
 				}
 			case <-deadline.C:
-				return false
+				return inboundOSUnknown
 			case <-o.done:
-				return false
+				return inboundOSUnknown
 			}
 		}
 	}
-	return false
-}
-
-func isWindowsObservedTTL(ttl uint8) bool {
-	return ttl >= windowsMinObservedTTL && ttl <= windowsMaxObservedTTL
+	return inboundOSUnknown
 }
 
 func (o *inboundTTLObserver) ensureNftTable() {

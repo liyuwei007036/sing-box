@@ -69,15 +69,30 @@ func (r *Router) RouteConnectionEx(ctx context.Context, conn net.Conn, metadata 
 	}
 }
 
-func (r *Router) withInboundTTL(ctx context.Context, metadata adapter.InboundContext) context.Context {
-	if r.inboundTTL != nil && metadata.Source.IsValid() && r.inboundTTL.IsWindowsSource(metadata.InboundType, metadata.Source.Addr, metadata.Source.Port) {
-		return dialer.WithInitialTTL(ctx, dialer.WindowsInitialTTL)
+func (r *Router) withInboundOSProfile(ctx context.Context, metadata adapter.InboundContext, outbound adapter.Outbound) context.Context {
+	if r.inboundTTL == nil || !metadata.Source.IsValid() {
+		return ctx
 	}
-	return ctx
+	isDirect := outbound != nil && outbound.Type() == C.TypeDirect
+	switch r.inboundTTL.LookupOSProfile(metadata.InboundType, metadata.Source.Addr, metadata.Source.Port) {
+	case inboundOSWindows:
+		return dialer.WithInitialTTL(ctx, dialer.WindowsInitialTTL)
+	case inboundOSApple:
+		if isDirect {
+			return dialer.WithAppleEgress(ctx)
+		}
+		return dialer.WithInitialTTL(ctx, dialer.AppleRelayTTL)
+	case inboundOSLinux:
+		if isDirect {
+			return ctx
+		}
+		return dialer.WithInitialTTL(ctx, dialer.LinuxRelayTTL)
+	default:
+		return ctx
+	}
 }
 
 func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) error {
-	ctx = r.withInboundTTL(ctx, metadata)
 	//nolint:staticcheck
 	if metadata.InboundDetour != "" {
 		if metadata.LastInbound == metadata.InboundDetour {
@@ -175,6 +190,7 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 	ctx = interrupt.ContextWithIsExternalConnection(ctx, true)
 	onClose = registerInterrupt(chain, conn, onClose)
 	outbound := chain[len(chain)-1]
+	ctx = r.withInboundOSProfile(ctx, metadata, outbound)
 	if outboundHandler, isHandler := outbound.(adapter.ConnectionHandler); isHandler {
 		outboundHandler.NewConnection(ctx, conn, metadata, onClose)
 	} else {
@@ -254,7 +270,6 @@ func (r *Router) RoutePacketConnectionEx(ctx context.Context, conn N.PacketConn,
 }
 
 func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) error {
-	ctx = r.withInboundTTL(ctx, metadata)
 	//nolint:staticcheck
 	if metadata.InboundDetour != "" {
 		if metadata.LastInbound == metadata.InboundDetour {
@@ -345,6 +360,7 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 	ctx = interrupt.ContextWithIsExternalConnection(ctx, true)
 	onClose = registerInterrupt(chain, conn, onClose)
 	outbound := chain[len(chain)-1]
+	ctx = r.withInboundOSProfile(ctx, metadata, outbound)
 	if outboundHandler, isHandler := outbound.(adapter.PacketConnectionHandler); isHandler {
 		outboundHandler.NewPacketConnection(ctx, conn, metadata, onClose)
 	} else {

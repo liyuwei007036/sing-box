@@ -9,11 +9,19 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// windowsTCPReceiveBuffer sets a 10 MiB socket receive buffer ceiling (~20 MiB
-// after kernel doubling; with Linux's default tcp_adv_win_scale=1, tcp_space is
-// ~10 MiB, strictly within (8 MiB, 16 MiB]) so tcp_select_initial_window natively
-// chooses Window Scale = 8 (matching Windows 10/11) without desyncing kernel state.
-const windowsTCPReceiveBuffer = 10 * 1024 * 1024
+const (
+	// windowsTCPReceiveBuffer sets a 10 MiB socket receive buffer ceiling (~20 MiB
+	// after kernel doubling; with Linux's default tcp_adv_win_scale=1, tcp_space is
+	// ~10 MiB, strictly within (8 MiB, 16 MiB]) so tcp_select_initial_window natively
+	// chooses Window Scale = 8 (matching Windows 10/11) without desyncing kernel state.
+	windowsTCPReceiveBuffer = 10 * 1024 * 1024
+
+	// appleTCPReceiveBuffer sets a 3 MiB socket receive buffer ceiling (~6 MiB
+	// after kernel doubling; tcp_space ~3 MiB, strictly within (2 MiB, 4 MiB]) so
+	// tcp_select_initial_window natively chooses Window Scale = 6 (matching Apple XNU
+	// macOS / iOS) without desyncing kernel state.
+	appleTCPReceiveBuffer = 3 * 1024 * 1024
+)
 
 func setInitialTTL(ttl int) control.Func {
 	if ttl <= 0 || ttl > 255 {
@@ -49,5 +57,24 @@ func setInitialTTL(ttl int) control.Func {
 			return err
 		}
 		return sockErr
+	}
+}
+
+func setAppleEgress(canMark bool) control.Func {
+	return func(network, address string, conn syscall.RawConn) error {
+		if network != "tcp" && network != "tcp4" && network != "tcp6" {
+			return nil
+		}
+		return conn.Control(func(fd uintptr) {
+			// Best-effort: let Linux natively negotiate WSCALE=6 for Apple XNU TCP SYNs.
+			if err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUFFORCE, appleTCPReceiveBuffer); err != nil {
+				_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF, appleTCPReceiveBuffer)
+			}
+			if canMark {
+				// Best-effort: tag this direct TCP socket so the output NFQUEUE rule
+				// rewrites ONLY its initial SYN to native Apple XNU options.
+				_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_MARK, int(AppleEgressMark))
+			}
+		})
 	}
 }

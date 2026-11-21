@@ -4,7 +4,6 @@ import (
 	"context"
 	"net"
 	"os"
-	"sync"
 
 	"github.com/sagernet/sing-anytls"
 	"github.com/sagernet/sing-box/adapter"
@@ -31,6 +30,11 @@ var (
 	_ adapter.IdleConnectionKeeper    = (*Outbound)(nil)
 )
 
+type anytlsClientPair struct {
+	client    *anytls.Client
+	uotClient *uot.Client
+}
+
 type Outbound struct {
 	outbound.Adapter
 	dialer        tls.Dialer
@@ -39,9 +43,7 @@ type Outbound struct {
 	clientOptions anytls.ClientOptions
 	client        *anytls.Client
 	uotClient     *uot.Client
-	winMu         sync.Mutex
-	winClient     *anytls.Client
-	winUOTClient  *uot.Client
+	ttlPool       dialer.TTLClientPool[anytlsClientPair]
 	logger        log.ContextLogger
 }
 
@@ -96,16 +98,28 @@ func (h *Outbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		return err
 	}
 	h.client = client
+	h.ttlPool.Init(func(ttl int) (anytlsClientPair, error) {
+		ttlOptions := h.clientOptions
+		ttlOptions.DialOut = h.dialOutWithTTL(ttl)
+		c, err := anytls.NewClient(ttlOptions)
+		if err != nil {
+			return anytlsClientPair{}, err
+		}
+		return anytlsClientPair{
+			client: c,
+			uotClient: &uot.Client{
+				Dialer:  anytlsDialer(c.DialContext),
+				Version: uot.Version,
+			},
+		}, nil
+	})
 	scope.Add(func() error {
 		err := client.Close()
-		h.winMu.Lock()
-		winClient := h.winClient
-		h.winClient = nil
-		h.winUOTClient = nil
-		h.winMu.Unlock()
-		if winClient != nil {
-			if winErr := winClient.Close(); winErr != nil && err == nil {
-				err = winErr
+		for _, pair := range h.ttlPool.TakeAll() {
+			if pair.client != nil {
+				if cErr := pair.client.Close(); cErr != nil && err == nil {
+					err = cErr
+				}
 			}
 		}
 		return err
@@ -131,30 +145,18 @@ func (h *Outbound) dialOut(ctx context.Context) (net.Conn, error) {
 	return h.dialer.DialTLSContext(adapter.ContextForMultiplexSession(ctx), h.server)
 }
 
-func (h *Outbound) dialOutWindows(ctx context.Context) (net.Conn, error) {
-	return h.dialer.DialTLSContext(dialer.WithInitialTTL(adapter.ContextForMultiplexSession(ctx), dialer.WindowsInitialTTL), h.server)
+func (h *Outbound) dialOutWithTTL(ttl int) func(context.Context) (net.Conn, error) {
+	return func(ctx context.Context) (net.Conn, error) {
+		return h.dialer.DialTLSContext(dialer.WithInitialTTL(adapter.ContextForMultiplexSession(ctx), ttl), h.server)
+	}
 }
 
 func (h *Outbound) selectClients(ctx context.Context) (*anytls.Client, *uot.Client, error) {
-	if !dialer.IsWindowsTTLContext(ctx) {
-		return h.client, h.uotClient, nil
+	pair, err := h.ttlPool.Get(ctx, anytlsClientPair{client: h.client, uotClient: h.uotClient})
+	if err != nil {
+		return nil, nil, err
 	}
-	h.winMu.Lock()
-	defer h.winMu.Unlock()
-	if h.winClient == nil {
-		winOptions := h.clientOptions
-		winOptions.DialOut = h.dialOutWindows
-		c, err := anytls.NewClient(winOptions)
-		if err != nil {
-			return nil, nil, err
-		}
-		h.winClient = c
-		h.winUOTClient = &uot.Client{
-			Dialer:  anytlsDialer(c.DialContext),
-			Version: uot.Version,
-		}
-	}
-	return h.winClient, h.winUOTClient, nil
+	return pair.client, pair.uotClient, nil
 }
 
 func (h *Outbound) MultiplexEnabled() bool {
@@ -163,32 +165,29 @@ func (h *Outbound) MultiplexEnabled() bool {
 
 func (h *Outbound) InterfaceUpdated(ctx context.Context) {
 	h.client.Reset()
-	h.winMu.Lock()
-	winClient := h.winClient
-	h.winMu.Unlock()
-	if winClient != nil {
-		winClient.Reset()
-	}
+	h.ttlPool.ForEach(func(pair anytlsClientPair) {
+		if pair.client != nil {
+			pair.client.Reset()
+		}
+	})
 }
 
 func (h *Outbound) SetKeepIdleConnections(keep bool) {
 	h.client.SetKeepIdleConnections(keep)
-	h.winMu.Lock()
-	winClient := h.winClient
-	h.winMu.Unlock()
-	if winClient != nil {
-		winClient.SetKeepIdleConnections(keep)
-	}
+	h.ttlPool.ForEach(func(pair anytlsClientPair) {
+		if pair.client != nil {
+			pair.client.SetKeepIdleConnections(keep)
+		}
+	})
 }
 
 func (h *Outbound) CloseIdleConnections() {
 	h.client.CloseIdleConnections()
-	h.winMu.Lock()
-	winClient := h.winClient
-	h.winMu.Unlock()
-	if winClient != nil {
-		winClient.CloseIdleConnections()
-	}
+	h.ttlPool.ForEach(func(pair anytlsClientPair) {
+		if pair.client != nil {
+			pair.client.CloseIdleConnections()
+		}
+	})
 }
 
 func (h *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {

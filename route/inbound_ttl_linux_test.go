@@ -10,12 +10,15 @@ import (
 	"testing"
 
 	"github.com/sagernet/nftables"
+	"github.com/sagernet/sing-box/common/dialer"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing-box/option"
+	M "github.com/sagernet/sing/common/metadata"
 	"golang.org/x/sys/unix"
 )
 
-func TestInboundTTLObserverTCPAndUDP(t *testing.T) {
+func TestInboundTTLObserverThreeOS(t *testing.T) {
 	obs, err := newInboundTTLObserver(log.NewNOPFactory().Logger())
 	if err != nil {
 		t.Fatalf("newInboundTTLObserver: %v", err)
@@ -26,25 +29,20 @@ func TestInboundTTLObserverTCPAndUDP(t *testing.T) {
 		}
 	}()
 
-	// 1. Test TCP with TTL=128 (Windows) and TTL=64 (Linux).
+	d, err := dialer.NewDefault(context.Background(), option.DialerOptions{})
+	if err != nil {
+		t.Fatalf("NewDefault: %v", err)
+	}
+
+	// 1. IPv4 TCP: Windows(128), Apple relay(255), Linux relay(192), Linux direct(64), Apple direct(64 + XNU SYN opts)
 	ln, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("tcp listen: %v", err)
 	}
 	defer ln.Close()
+	dst4 := M.ParseSocksaddr(ln.Addr().String())
 
-	dialWithTTL := func(ttl int) netip.AddrPort {
-		d := net.Dialer{
-			Control: func(network, address string, c syscall.RawConn) error {
-				var sockErr error
-				if err := c.Control(func(fd uintptr) {
-					sockErr = unix.SetsockoptInt(int(fd), unix.IPPROTO_IP, unix.IP_TTL, ttl)
-				}); err != nil {
-					return err
-				}
-				return sockErr
-			},
-		}
+	dialTCP4 := func(ctx context.Context) netip.AddrPort {
 		done := make(chan netip.AddrPort, 1)
 		go func() {
 			c, err := ln.Accept()
@@ -54,25 +52,33 @@ func TestInboundTTLObserverTCPAndUDP(t *testing.T) {
 			defer c.Close()
 			done <- c.RemoteAddr().(*net.TCPAddr).AddrPort()
 		}()
-		c, err := d.DialContext(context.Background(), "tcp4", ln.Addr().String())
+		c, err := d.DialContext(ctx, "tcp4", dst4)
 		if err != nil {
-			t.Fatalf("dial tcp ttl=%d: %v", ttl, err)
+			t.Fatalf("dial tcp4: %v", err)
 		}
 		defer c.Close()
 		return <-done
 	}
 
-	winTCP := dialWithTTL(128)
-	if !obs.IsWindowsSource(C.TypeVLESS, winTCP.Addr(), winTCP.Port()) {
-		t.Fatalf("expected TCP src %v (TTL 128) to be detected as Windows", winTCP)
+	checkProfile := func(name, inboundType string, ap netip.AddrPort, want inboundOSProfile) {
+		t.Helper()
+		got := obs.LookupOSProfile(inboundType, ap.Addr(), ap.Port())
+		if got != want {
+			t.Fatalf("%s (%v): got profile=%d, want %d", name, ap, got, want)
+		}
 	}
 
-	linuxTCP := dialWithTTL(64)
-	if obs.IsWindowsSource(C.TypeVLESS, linuxTCP.Addr(), linuxTCP.Port()) {
-		t.Fatalf("expected TCP src %v (TTL 64) to be detected as non-Windows", linuxTCP)
+	checkProfile("IPv4 TCP Windows(128)", C.TypeVLESS, dialTCP4(dialer.WithInitialTTL(context.Background(), dialer.WindowsInitialTTL)), inboundOSWindows)
+	checkProfile("IPv4 TCP Apple relay(255)", C.TypeVLESS, dialTCP4(dialer.WithInitialTTL(context.Background(), dialer.AppleRelayTTL)), inboundOSApple)
+	checkProfile("IPv4 TCP Linux relay(192)", C.TypeVLESS, dialTCP4(dialer.WithInitialTTL(context.Background(), dialer.LinuxRelayTTL)), inboundOSLinux)
+	checkProfile("IPv4 TCP Linux direct(64)", C.TypeVLESS, dialTCP4(context.Background()), inboundOSLinux)
+	if obs.synRW != nil {
+		// Dialing with WithAppleEgress produces a real kernel Apple XNU TCP SYN
+		// (TTL=64, options [2,1,3,1,1,8,4,0,0]) which NFLOG must classify as Apple.
+		checkProfile("IPv4 TCP Apple direct(64+XNU opts)", C.TypeVLESS, dialTCP4(dialer.WithAppleEgress(context.Background())), inboundOSApple)
 	}
 
-	// 2. Test UDP (e.g. Hysteria2) with TTL=128 and TTL=64.
+	// 2. IPv4 UDP (Hysteria2/TUIC): Windows(128), Apple relay(255), Linux relay(192), Direct UDP(64 -> Apple fallback)
 	srvPC, err := net.ListenPacket("udp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("udp listen: %v", err)
@@ -107,31 +113,16 @@ func TestInboundTTLObserverTCPAndUDP(t *testing.T) {
 		return addr.(*net.UDPAddr).AddrPort()
 	}
 
-	winUDP := sendUDPWithTTL(128)
-	if !obs.IsWindowsSource(C.TypeHysteria2, winUDP.Addr(), winUDP.Port()) {
-		t.Fatalf("expected UDP src %v (TTL 128) to be detected as Windows", winUDP)
-	}
+	checkProfile("IPv4 UDP Windows(128)", C.TypeHysteria2, sendUDPWithTTL(128), inboundOSWindows)
+	checkProfile("IPv4 UDP Apple relay(255)", C.TypeHysteria2, sendUDPWithTTL(255), inboundOSApple)
+	checkProfile("IPv4 UDP Linux relay(192)", C.TypeHysteria2, sendUDPWithTTL(192), inboundOSLinux)
+	checkProfile("IPv4 UDP direct(64 -> Apple fallback)", C.TypeHysteria2, sendUDPWithTTL(64), inboundOSApple)
 
-	linuxUDP := sendUDPWithTTL(64)
-	if obs.IsWindowsSource(C.TypeHysteria2, linuxUDP.Addr(), linuxUDP.Port()) {
-		t.Fatalf("expected UDP src %v (TTL 64) to be detected as non-Windows", linuxUDP)
-	}
-
-	// 3. Test IPv6 TCP Hop Limit (128 vs 64).
+	// 3. IPv6 TCP HopLimit & direct Apple SYN (84B = 40B IPv6 + 44B Apple TCP SYN within snaplen=128)
 	if ln6, err := net.Listen("tcp6", "[::1]:0"); err == nil {
 		defer ln6.Close()
-		dialV6 := func(hops int) netip.AddrPort {
-			d := net.Dialer{
-				Control: func(network, address string, c syscall.RawConn) error {
-					var sockErr error
-					if err := c.Control(func(fd uintptr) {
-						sockErr = unix.SetsockoptInt(int(fd), unix.IPPROTO_IPV6, unix.IPV6_UNICAST_HOPS, hops)
-					}); err != nil {
-						return err
-					}
-					return sockErr
-				},
-			}
+		dst6 := M.ParseSocksaddr(ln6.Addr().String())
+		dialTCP6 := func(ctx context.Context) netip.AddrPort {
 			done := make(chan netip.AddrPort, 1)
 			go func() {
 				c, err := ln6.Accept()
@@ -141,20 +132,19 @@ func TestInboundTTLObserverTCPAndUDP(t *testing.T) {
 				defer c.Close()
 				done <- c.RemoteAddr().(*net.TCPAddr).AddrPort()
 			}()
-			c, err := d.DialContext(context.Background(), "tcp6", ln6.Addr().String())
+			c, err := d.DialContext(ctx, "tcp6", dst6)
 			if err != nil {
-				t.Fatalf("dial tcp6 hops=%d: %v", hops, err)
+				t.Fatalf("dial tcp6: %v", err)
 			}
 			defer c.Close()
 			return <-done
 		}
-		winV6 := dialV6(128)
-		if !obs.IsWindowsSource(C.TypeVLESS, winV6.Addr(), winV6.Port()) {
-			t.Fatalf("expected IPv6 TCP src %v (HopLimit 128) to be detected as Windows", winV6)
-		}
-		linV6 := dialV6(64)
-		if obs.IsWindowsSource(C.TypeVLESS, linV6.Addr(), linV6.Port()) {
-			t.Fatalf("expected IPv6 TCP src %v (HopLimit 64) to be detected as non-Windows", linV6)
+		checkProfile("IPv6 TCP Windows(128)", C.TypeVLESS, dialTCP6(dialer.WithInitialTTL(context.Background(), dialer.WindowsInitialTTL)), inboundOSWindows)
+		checkProfile("IPv6 TCP Apple relay(255)", C.TypeVLESS, dialTCP6(dialer.WithInitialTTL(context.Background(), dialer.AppleRelayTTL)), inboundOSApple)
+		checkProfile("IPv6 TCP Linux relay(192)", C.TypeVLESS, dialTCP6(dialer.WithInitialTTL(context.Background(), dialer.LinuxRelayTTL)), inboundOSLinux)
+		checkProfile("IPv6 TCP Linux direct(64)", C.TypeVLESS, dialTCP6(context.Background()), inboundOSLinux)
+		if obs.synRW != nil {
+			checkProfile("IPv6 TCP Apple direct(64+XNU opts)", C.TypeVLESS, dialTCP6(dialer.WithAppleEgress(context.Background())), inboundOSApple)
 		}
 	}
 
@@ -164,8 +154,5 @@ func TestInboundTTLObserverTCPAndUDP(t *testing.T) {
 		t.Fatalf("simulate external nft table deletion: %v", err)
 	}
 	obs.ensureNftTable()
-	winAfterHeal := dialWithTTL(128)
-	if !obs.IsWindowsSource(C.TypeVLESS, winAfterHeal.Addr(), winAfterHeal.Port()) {
-		t.Fatalf("expected TCP src %v (TTL 128) to be detected after nft table self-heal", winAfterHeal)
-	}
+	checkProfile("IPv4 TCP Windows after nft self-heal", C.TypeVLESS, dialTCP4(dialer.WithInitialTTL(context.Background(), dialer.WindowsInitialTTL)), inboundOSWindows)
 }
