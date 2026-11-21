@@ -64,6 +64,7 @@ type inboundTTLEntry struct {
 type inboundTTLObserver struct {
 	logger    log.ContextLogger
 	nlConn    *netlink.Conn
+	synRW     *outboundSYNRewriter
 	nftMu     sync.Mutex
 	nftConn   *nftables.Conn
 	tableName string
@@ -108,8 +109,16 @@ func newInboundTTLObserver(logger log.ContextLogger) (*inboundTTLObserver, error
 		return nil, fmt.Errorf("open nftables netlink: %w", err)
 	}
 
+	synRW, synErr := newOutboundSYNRewriter(logger, boundGroup)
+	if synErr != nil && logger != nil {
+		logger.Warn("outbound Windows SYN option rewriter unavailable (falling back to TTL-only): ", synErr)
+	}
+
 	tableName := fmt.Sprintf("sing_box_ttl_%d", boundGroup)
-	if err := installInboundTTLNftRules(nftConn, tableName, boundGroup); err != nil {
+	if err := installInboundTTLNftRules(nftConn, tableName, boundGroup, synRW != nil); err != nil {
+		if synRW != nil {
+			_ = synRW.Close()
+		}
 		_ = nflogUnbindGroup(nlConn, boundGroup)
 		_ = nlConn.Close()
 		return nil, fmt.Errorf("install nftables ttl rules: %w", err)
@@ -118,6 +127,7 @@ func newInboundTTLObserver(logger log.ContextLogger) (*inboundTTLObserver, error
 	obs := &inboundTTLObserver{
 		logger:    logger,
 		nlConn:    nlConn,
+		synRW:     synRW,
 		nftConn:   nftConn,
 		tableName: tableName,
 		group:     boundGroup,
@@ -198,7 +208,7 @@ func nflogUnbindGroup(conn *netlink.Conn, group uint16) error {
 	return err
 }
 
-func installInboundTTLNftRules(conn *nftables.Conn, tableName string, group uint16) error {
+func installInboundTTLNftRules(conn *nftables.Conn, tableName string, group uint16, withOutboundSYN bool) error {
 	// Best-effort cleanup of any stale table left behind by a prior SIGKILL/OOM
 	// restart that previously owned this exact exclusive NFLOG group.
 	conn.DelTable(&nftables.Table{
@@ -255,6 +265,9 @@ func installInboundTTLNftRules(conn *nftables.Conn, tableName string, group uint
 				},
 			},
 		})
+	}
+	if withOutboundSYN {
+		addOutboundSYNNftRules(conn, table, group)
 	}
 	return conn.Flush()
 }
@@ -494,7 +507,7 @@ func (o *inboundTTLObserver) ensureNftTable() {
 			return
 		}
 	}
-	if err := installInboundTTLNftRules(o.nftConn, o.tableName, o.group); err != nil {
+	if err := installInboundTTLNftRules(o.nftConn, o.tableName, o.group, o.synRW != nil); err != nil {
 		if o.logger != nil {
 			o.logger.Warn("reinstall inbound TTL nftables table: ", err)
 		}
@@ -574,6 +587,11 @@ func (o *inboundTTLObserver) Close() error {
 			}
 		}
 		o.nftMu.Unlock()
+		if o.synRW != nil {
+			if err := o.synRW.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
 		if o.nlConn != nil {
 			// Closing the netfilter netlink socket releases all bound NFLOG groups
 			// in the kernel automatically without racing with readLoop's Receive().
