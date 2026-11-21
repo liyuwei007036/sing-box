@@ -56,7 +56,7 @@ func NewClientWithOptions(d N.Dialer, logger logger.Logger, options option.Outbo
 	}
 	base, err := mux.NewClient(baseOpts)
 	if err != nil {
-		return nil, er
+		return nil, err
 	}
 	return &Client{
 		base: base,
@@ -77,7 +77,7 @@ func (c *Client) selectClient(ctx context.Context) (*mux.Client, error) {
 	if c.win == nil {
 		w, err := c.newWinClient()
 		if err != nil {
-			return nil, er
+			return nil, err
 		}
 		c.win = w
 	}
@@ -87,7 +87,7 @@ func (c *Client) selectClient(ctx context.Context) (*mux.Client, error) {
 func (c *Client) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	client, err := c.selectClient(ctx)
 	if err != nil {
-		return nil, er
+		return nil, err
 	}
 	return client.DialContext(ctx, network, destination)
 }
@@ -95,7 +95,7 @@ func (c *Client) DialContext(ctx context.Context, network string, destination M.
 func (c *Client) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	client, err := c.selectClient(ctx)
 	if err != nil {
-		return nil, er
+		return nil, err
 	}
 	return client.ListenPacket(ctx, destination)
 }
@@ -138,14 +138,14 @@ func (c *Client) Close() error {
 	c.winMu.Unlock()
 	if win != nil {
 		if winErr := win.Close(); winErr != nil && err == nil {
-			err = winEr
+			err = winErr
 		}
 	}
-	return er
+	return err
 }
 
 type clientDialer struct {
-	N.Diale
+	N.Dialer
 	initialTTL int
 }
 

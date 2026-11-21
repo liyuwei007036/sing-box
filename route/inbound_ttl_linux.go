@@ -52,7 +52,7 @@ const (
 
 type inboundTTLKey struct {
 	proto   uint8
-	srcIP   netip.Add
+	srcIP   netip.Addr
 	srcPort uint16
 }
 
@@ -62,7 +62,7 @@ type inboundTTLEntry struct {
 }
 
 type inboundTTLObserver struct {
-	logger    log.ContextLogge
+	logger    log.ContextLogger
 	nlConn    *netlink.Conn
 	nftMu     sync.Mutex
 	nftConn   *nftables.Conn
@@ -86,14 +86,14 @@ func newInboundTTLObserver(logger log.ContextLogger) (*inboundTTLObserver, error
 	_ = nlConn.SetReadBuffer(1 << 20)
 
 	var boundGroup uint16
-	var bindErr erro
+	var bindErr error
 	for g := uint16(inboundTTLGroupBase); g <= inboundTTLGroupMax; g++ {
 		if err := nflogBindGroup(nlConn, g); err == nil {
 			boundGroup = g
 			bindErr = nil
 			break
 		} else {
-			bindErr = er
+			bindErr = err
 		}
 	}
 	if bindErr != nil {
@@ -133,7 +133,7 @@ func newInboundTTLObserver(logger log.ContextLogger) (*inboundTTLObserver, error
 func nflogConfigMessage(group uint16, attrs []netlink.Attribute) (netlink.Message, error) {
 	attrBytes, err := netlink.MarshalAttributes(attrs)
 	if err != nil {
-		return netlink.Message{}, er
+		return netlink.Message{}, err
 	}
 	data := make([]byte, 4+len(attrBytes))
 	data[0] = unix.AF_UNSPEC
@@ -150,19 +150,16 @@ func nflogConfigMessage(group uint16, attrs []netlink.Attribute) (netlink.Messag
 }
 
 func nflogBindGroup(conn *netlink.Conn, group uint16) error {
-	// Bind group.
 	bindMsg, err := nflogConfigMessage(group, []netlink.Attribute{
 		{Type: nfulaCfgCmd, Data: []byte{nfulnlCfgCmdBind}},
 	})
 	if err != nil {
-		return er
+		return err
 	}
 	if _, err := conn.Execute(bindMsg); err != nil {
-		return er
+		return err
 	}
 
-	// Configure copy-packet mode (snaplen 64), queue threshold 1 (immediate flush),
-	// and minimal flush timeout (10ms) so new flows are visible before accept/handshake completes.
 	modeBuf := make([]byte, 6)
 	binary.BigEndian.PutUint32(modeBuf[0:4], inboundTTLSnaplen)
 	modeBuf[4] = nfulnlCopyPacket
@@ -181,11 +178,11 @@ func nflogBindGroup(conn *netlink.Conn, group uint16) error {
 	})
 	if err != nil {
 		_ = nflogUnbindGroup(conn, group)
-		return er
+		return err
 	}
 	if _, err := conn.Execute(cfgMsg); err != nil {
 		_ = nflogUnbindGroup(conn, group)
-		return er
+		return err
 	}
 	return nil
 }
@@ -195,10 +192,10 @@ func nflogUnbindGroup(conn *netlink.Conn, group uint16) error {
 		{Type: nfulaCfgCmd, Data: []byte{nfulnlCfgCmdUnbind}},
 	})
 	if err != nil {
-		return er
+		return err
 	}
 	_, err = conn.Execute(msg)
-	return er
+	return err
 }
 
 func installInboundTTLNftRules(conn *nftables.Conn, tableName string, group uint16) error {
@@ -563,7 +560,7 @@ func (o *inboundTTLObserver) evictLocked(now int64) {
 }
 
 func (o *inboundTTLObserver) Close() error {
-	var firstErr erro
+	var firstErr error
 	o.closeOnce.Do(func() {
 		close(o.done)
 		o.nftMu.Lock()
@@ -573,7 +570,7 @@ func (o *inboundTTLObserver) Close() error {
 				Name:   o.tableName,
 			})
 			if err := o.nftConn.Flush(); err != nil {
-				firstErr = er
+				firstErr = err
 			}
 		}
 		o.nftMu.Unlock()
@@ -581,9 +578,9 @@ func (o *inboundTTLObserver) Close() error {
 			// Closing the netfilter netlink socket releases all bound NFLOG groups
 			// in the kernel automatically without racing with readLoop's Receive().
 			if err := o.nlConn.Close(); err != nil && firstErr == nil {
-				firstErr = er
+				firstErr = err
 			}
 		}
 	})
-	return firstEr
+	return firstErr
 }

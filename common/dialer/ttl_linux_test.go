@@ -1,6 +1,6 @@
 //go:build linux
 
-package diale
+package dialer
 
 import (
 	"context"
@@ -20,7 +20,7 @@ func getSocketIPv4TTL(t *testing.T, sc syscall.Conn) int {
 		t.Fatalf("SyscallConn: %v", err)
 	}
 	var ttl int
-	var sockErr erro
+	var sockErr error
 	if err := raw.Control(func(fd uintptr) {
 		ttl, sockErr = unix.GetsockoptInt(int(fd), unix.IPPROTO_IP, unix.IP_TTL)
 	}); err != nil {

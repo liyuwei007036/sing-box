@@ -1,6 +1,6 @@
 //go:build linux
 
-package diale
+package dialer
 
 import (
 	"syscall"
@@ -14,7 +14,7 @@ func setInitialTTL(ttl int) control.Func {
 		return nil
 	}
 	return func(network, address string, conn syscall.RawConn) error {
-		var sockErr erro
+		var sockErr error
 		err := conn.Control(func(fd uintptr) {
 			switch network {
 			case "tcp4", "udp4":
@@ -34,8 +34,8 @@ func setInitialTTL(ttl int) control.Func {
 			}
 		})
 		if err != nil {
-			return er
+			return err
 		}
-		return sockEr
+		return sockErr
 	}
 }

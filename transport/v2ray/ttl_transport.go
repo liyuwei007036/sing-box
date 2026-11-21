@@ -12,10 +12,10 @@ import (
 )
 
 type ttlSplitClientTransport struct {
-	base    adapter.V2RayClientTransport
-	winMu   sync.Mutex
-	win     adapter.V2RayClientTransport
-	newWin  func() (adapter.V2RayClientTransport, error)
+	base   adapter.V2RayClientTransport
+	winMu  sync.Mutex
+	win    adapter.V2RayClientTransport
+	newWin func() (adapter.V2RayClientTransport, error)
 }
 
 var (
@@ -54,7 +54,7 @@ func (t *ttlSplitClientTransport) selectTransport(ctx context.Context) (adapter.
 	if t.win == nil {
 		w, err := t.newWin()
 		if err != nil {
-			return nil, er
+			return nil, err
 		}
 		t.win = w
 	}
@@ -64,7 +64,7 @@ func (t *ttlSplitClientTransport) selectTransport(ctx context.Context) (adapter.
 func (t *ttlSplitClientTransport) DialContext(ctx context.Context) (net.Conn, error) {
 	tr, err := t.selectTransport(ctx)
 	if err != nil {
-		return nil, er
+		return nil, err
 	}
 	return tr.DialContext(ctx)
 }
@@ -112,8 +112,8 @@ func (t *ttlSplitClientTransport) Close() error {
 	t.winMu.Unlock()
 	if win != nil {
 		if winErr := win.Close(); winErr != nil && err == nil {
-			err = winEr
+			err = winErr
 		}
 	}
-	return er
+	return err
 }

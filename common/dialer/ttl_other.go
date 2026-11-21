@@ -1,6 +1,6 @@
 //go:build !linux
 
-package diale
+package dialer
 
 import "github.com/sagernet/sing/common/control"
 

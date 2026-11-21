@@ -1,4 +1,4 @@
-package diale
+package dialer
 
 import (
 	"context"
@@ -41,7 +41,7 @@ func IsWindowsTTLContext(ctx context.Context) bool {
 }
 
 type ttlDialer struct {
-	inner N.Diale
+	inner N.Dialer
 	ttl   int
 }
 
