@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/common/interrupt"
 	"github.com/sagernet/sing-box/common/sniff"
 	C "github.com/sagernet/sing-box/constant"
@@ -68,7 +69,15 @@ func (r *Router) RouteConnectionEx(ctx context.Context, conn net.Conn, metadata 
 	}
 }
 
+func (r *Router) withInboundTTL(ctx context.Context, metadata adapter.InboundContext) context.Context {
+	if r.inboundTTL != nil && metadata.Source.IsValid() && r.inboundTTL.IsWindowsSource(metadata.InboundType, metadata.Source.Addr, metadata.Source.Port) {
+		return dialer.WithInitialTTL(ctx, dialer.WindowsInitialTTL)
+	}
+	return ctx
+}
+
 func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) error {
+	ctx = r.withInboundTTL(ctx, metadata)
 	//nolint:staticcheck
 	if metadata.InboundDetour != "" {
 		if metadata.LastInbound == metadata.InboundDetour {
@@ -245,6 +254,7 @@ func (r *Router) RoutePacketConnectionEx(ctx context.Context, conn N.PacketConn,
 }
 
 func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) error {
+	ctx = r.withInboundTTL(ctx, metadata)
 	//nolint:staticcheck
 	if metadata.InboundDetour != "" {
 		if metadata.LastInbound == metadata.InboundDetour {

@@ -277,18 +277,39 @@ func (d *DefaultDialer) DialContext(ctx context.Context, network string, address
 		return nil, E.New("domain not resolved")
 	}
 	if d.networkStrategy == nil {
+		ttlFunc := setInitialTTL(InitialTTLFromContext(ctx))
 		conn, err := listener.ListenNetworkNamespace[net.Conn](ctx, d.netns, func() (net.Conn, error) {
 			switch N.NetworkName(network) {
 			case N.NetworkUDP:
 				if !address.IsIPv6() {
+					if ttlFunc != nil {
+						ud := d.udpDialer4
+						ud.Control = control.Append(ud.Control, ttlFunc)
+						return ud.DialContext(ctx, network, address.String())
+					}
 					return d.udpDialer4.DialContext(ctx, network, address.String())
 				} else {
+					if ttlFunc != nil {
+						ud := d.udpDialer6
+						ud.Control = control.Append(ud.Control, ttlFunc)
+						return ud.DialContext(ctx, network, address.String())
+					}
 					return d.udpDialer6.DialContext(ctx, network, address.String())
 				}
 			}
 			if !address.IsIPv6() {
+				if ttlFunc != nil {
+					td := d.dialer4
+					td.Control = control.Append(td.Control, ttlFunc)
+					return DialSlowContext(&td, ctx, d.netns, network, address)
+				}
 				return DialSlowContext(&d.dialer4, ctx, d.netns, network, address)
 			} else {
+				if ttlFunc != nil {
+					td := d.dialer6
+					td.Control = control.Append(td.Control, ttlFunc)
+					return DialSlowContext(&td, ctx, d.netns, network, address)
+				}
 				return DialSlowContext(&d.dialer6, ctx, d.netns, network, address)
 			}
 		})
@@ -320,6 +341,9 @@ func (d *DefaultDialer) DialParallelInterface(ctx context.Context, network strin
 	} else {
 		dialer = d.udpDialer4
 	}
+	if ttlFunc := setInitialTTL(InitialTTLFromContext(ctx)); ttlFunc != nil {
+		dialer.Control = control.Append(dialer.Control, ttlFunc)
+	}
 	fastFallback := time.Since(d.networkLastFallback.Load()) < C.TCPTimeout
 	var (
 		conn      net.Conn
@@ -350,6 +374,9 @@ func (d *DefaultDialer) ListenPacket(ctx context.Context, destination M.Socksadd
 	if d.networkStrategy == nil {
 		packetConn, err := listener.ListenNetworkNamespace[net.PacketConn](ctx, d.netns, func() (net.PacketConn, error) {
 			listenConfig := d.udpListener
+			if ttlFunc := setInitialTTL(InitialTTLFromContext(ctx)); ttlFunc != nil {
+				listenConfig.Control = control.Append(listenConfig.Control, ttlFunc)
+			}
 			if d.autoDetectBindFunc != nil {
 				listenConfig.Control = control.Append(listenConfig.Control, func(network, address string, conn syscall.RawConn) error {
 					if destination.Addr.IsValid() {
@@ -405,6 +432,9 @@ func (d *DefaultDialer) ListenSerialInterfacePacket(ctx context.Context, destina
 		network += "4"
 	}
 	listenConfig := d.udpListener
+	if ttlFunc := setInitialTTL(InitialTTLFromContext(ctx)); ttlFunc != nil {
+		listenConfig.Control = control.Append(listenConfig.Control, ttlFunc)
+	}
 	listenConfig.Control = control.Append(listenConfig.Control, d.serialInterfaceControl(*strategy, interfaceType, fallbackInterfaceType))
 	packetConn, err := listenConfig.ListenPacket(ctx, network, "")
 	if err != nil {

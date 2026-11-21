@@ -50,16 +50,37 @@ func NewClientTransport(ctx context.Context, dialer N.Dialer, serverAddr M.Socks
 	}
 	switch options.Type {
 	case C.V2RayTransportTypeHTTP:
-		return v2rayhttp.NewClient(ctx, dialer, serverAddr, options.HTTPOptions, tlsConfig)
+		base, err := v2rayhttp.NewClient(ctx, dialer, serverAddr, options.HTTPOptions, tlsConfig)
+		if err != nil {
+			return nil, err
+		}
+		if tlsConfig == nil {
+			return base, nil
+		}
+		return wrapMultiplexClientTransport(base, dialer, tlsConfig, func(d N.Dialer, tlsCfg tls.Config) (adapter.V2RayClientTransport, error) {
+			return v2rayhttp.NewClient(ctx, d, serverAddr, options.HTTPOptions, tlsCfg)
+		}), nil
 	case C.V2RayTransportTypeGRPC:
-		return NewGRPCClient(ctx, dialer, serverAddr, options.GRPCOptions, tlsConfig)
+		base, err := NewGRPCClient(ctx, dialer, serverAddr, options.GRPCOptions, tlsConfig)
+		if err != nil {
+			return nil, err
+		}
+		return wrapMultiplexClientTransport(base, dialer, tlsConfig, func(d N.Dialer, tlsCfg tls.Config) (adapter.V2RayClientTransport, error) {
+			return NewGRPCClient(ctx, d, serverAddr, options.GRPCOptions, tlsCfg)
+		}), nil
 	case C.V2RayTransportTypeWebsocket:
 		return v2raywebsocket.NewClient(ctx, dialer, serverAddr, options.WebsocketOptions, tlsConfig)
 	case C.V2RayTransportTypeQUIC:
 		if tlsConfig == nil {
 			return nil, C.ErrTLSRequired
 		}
-		return NewQUICClient(ctx, dialer, serverAddr, options.QUICOptions, tlsConfig)
+		base, err := NewQUICClient(ctx, dialer, serverAddr, options.QUICOptions, tlsConfig)
+		if err != nil {
+			return nil, err
+		}
+		return wrapMultiplexClientTransport(base, dialer, tlsConfig, func(d N.Dialer, tlsCfg tls.Config) (adapter.V2RayClientTransport, error) {
+			return NewQUICClient(ctx, d, serverAddr, options.QUICOptions, tlsCfg)
+		}), nil
 	case C.V2RayTransportTypeHTTPUpgrade:
 		return v2rayhttpupgrade.NewClient(ctx, dialer, serverAddr, options.HTTPUpgradeOptions, tlsConfig)
 	default:

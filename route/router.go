@@ -47,6 +47,7 @@ type Router struct {
 	pauseManager      pause.Manager
 	trackers          []adapter.ConnectionTracker
 	platformInterface adapter.PlatformInterface
+	inboundTTL        *inboundTTLObserver
 }
 
 func NewRouter(ctx context.Context, logFactory log.Factory, options option.RouteOptions, dnsOptions option.DNSOptions) *Router {
@@ -203,6 +204,13 @@ func (r *Router) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 			processCache := common.Must1(freelru.New[processCacheKey, processCacheEntry](256, maphash.NewHasher[processCacheKey]().Hash32, true))
 			processCache.SetLifetime(200 * time.Millisecond)
 			r.processCache = processCache
+		}
+		if obs, err := newInboundTTLObserver(r.logger); err != nil {
+			r.logger.Warn(E.Cause(err, "inbound TTL observer unavailable"))
+		} else if obs != nil {
+			r.inboundTTL = obs
+			r.logger.Info("inbound TTL observer started (nflog group ", obs.Group(), ")")
+			scope.Add(obs.Close)
 		}
 	case adapter.StartStatePostStart:
 		for i, rule := range r.rules {
